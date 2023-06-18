@@ -17,6 +17,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
@@ -199,16 +200,12 @@ func modifyForwardLine(corefile string, ips []net.IP) string {
 }
 
 func modifyCoreDNSConfigMap(ips []net.IP) error {
-	// Load the Kubernetes configuration from the default location
-	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
+	var kubeClient kubernetes.Interface
+	_, err := rest.InClusterConfig()
 	if err != nil {
-		return fmt.Errorf("failed to load Kubernetes config: %v", err)
-	}
-
-	// Create a new Kubernetes client
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return fmt.Errorf("failed to create Kubernetes client: %v", err)
+		log.Fatalln("only in cluster config is supported")
+	} else {
+		kubeClient = getClient()
 	}
 
 	// Retrieve the CoreDNS ConfigMap in the current namespace
@@ -218,7 +215,7 @@ func modifyCoreDNSConfigMap(ips []net.IP) error {
 		namespace = metav1.NamespaceDefault
 	}
 	configMapName := "coredns"
-	configMap, err := clientset.CoreV1().ConfigMaps(namespace).Get(context.TODO(), configMapName, metav1.GetOptions{})
+	configMap, err := kubeClient.CoreV1().ConfigMaps(namespace).Get(context.TODO(), configMapName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to retrieve ConfigMap %s: %v", configMapName, err)
 	}
@@ -236,11 +233,24 @@ func modifyCoreDNSConfigMap(ips []net.IP) error {
 	configMap.Data["Corefile"] = newCorefile
 
 	// Update the ConfigMap
-	_, err = clientset.CoreV1().ConfigMaps(namespace).Update(context.TODO(), configMap, metav1.UpdateOptions{})
+	_, err = kubeClient.CoreV1().ConfigMaps(namespace).Update(context.TODO(), configMap, metav1.UpdateOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to update ConfigMap %s: %v", configMapName, err)
 	}
 
 	log.Infof("Modified ConfigMap %s/%s successfully", namespace, configMapName)
 	return nil
+}
+func getClient() kubernetes.Interface {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		log.Fatalf("Can not get kubernetes config: %v", err)
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Fatalf("Can not create kubernetes client: %v", err)
+	}
+
+	return clientset
 }
