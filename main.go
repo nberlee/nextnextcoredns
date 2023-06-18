@@ -95,6 +95,7 @@ func main() {
 			continue
 		}
 
+		log.Infof("Selected %s with total rtt %d", result.server, result.rtt)
 		nextdnsResolvers = append(nextdnsResolvers, lookup)
 		numResults++
 
@@ -102,7 +103,7 @@ func main() {
 			break
 		}
 	}
-	log.Infof("NextDNS resolvers: %v", nextdnsResolvers)
+	log.Infof("NextDNS resolvers (ip): %v", nextdnsResolvers)
 	if numResults < 3 {
 		log.Fatalf("Only found %d resolvers", numResults)
 	}
