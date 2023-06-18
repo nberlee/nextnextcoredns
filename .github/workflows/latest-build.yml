@@ -1,6 +1,5 @@
 name: Docker image
 on:
-on:
   push:
     branches: [ main ]
   pull_request:
