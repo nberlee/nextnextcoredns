@@ -1,8 +1,11 @@
 name: Docker image
 on:
-  workflow_run:
-    branches:
-      - 'main'
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
 jobs:
   build:
     name: Build
