@@ -3,6 +3,7 @@ module github.com/nberlee/nextnextcoredns
 go 1.20
 
 require (
+	github.com/babolivier/go-doh-client v0.0.0-20201028162107-a76cff4cb8b6
 	github.com/sirupsen/logrus v1.9.3
 	go.uber.org/automaxprocs v1.5.2
 	k8s.io/apimachinery v0.27.3

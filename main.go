@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/babolivier/go-doh-client"
+
 	log "github.com/sirupsen/logrus"
 	_ "go.uber.org/automaxprocs"
 
@@ -23,10 +25,8 @@ import (
 )
 
 type Server struct {
-	Pop    string `json:"pop"`
-	Server string `json:"server"`
-	IPv4   bool   `json:"ipv4"`
-	IPv6   bool   `json:"ipv6"`
+	Hostname string   `json:"hostname"`
+	IPs      []string `json:"ips"`
 }
 
 type Info struct {
@@ -40,64 +40,112 @@ type Result struct {
 	rtt    int
 }
 
-func main() {
-	resp, _ := http.Get("https://router.nextdns.io/?source=ping")
-	body, _ := io.ReadAll(resp.Body)
+func getNextDNSRouterIps() []Result {
 
-	var servers []Server
-	json.Unmarshal(body, &servers)
+	dohResolver := doh.Resolver{
+		Host: "45.90.28.0",
+		HTTPClient: &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConnsPerHost: -1,
+				TLSClientConfig:     &tls.Config{ServerName: "dns.nextdns.io"},
+			},
+		},
 
-	results := make([]Result, len(servers)*2)
-	v6offset := len(servers)
-	var fqdn string
-	for j := 0; j < 3; j++ {
-		for i, server := range servers {
-			if server.IPv4 {
-				fqdn = fmt.Sprintf("ipv4-%s.edge.nextdns.io", server.Server)
-				url := fmt.Sprintf("https://%s/info", fqdn)
-				rtt := checkServer(url)
-				log.Infof("%s has a rtt of %d", fqdn, rtt)
+		Class: doh.IN,
+	}
 
-				if j > 0 {
-					results[i].rtt += rtt
-				} else {
-					results[i] = Result{server: fqdn, rtt: rtt}
-				}
+	// Create a custom transport with a modified Dial function
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			ServerName: "router.nextdns.io",
+		},
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Create a custom dialer with the modified DNS resolver
+			dialer := &net.Dialer{
+				Timeout:   30 * time.Second,
+				DualStack: true,
 			}
 
-			if server.IPv6 {
-				v6index := i + v6offset
-				fqdn = fmt.Sprintf("ipv6-%s.edge.nextdns.io", server.Server)
-				url := fmt.Sprintf("https://%s/info", fqdn)
-				rtt := checkServer(url)
-				log.Infof("%s has a rtt of %d", fqdn, rtt)
+			if strings.HasSuffix(network, "6") {
+				record, _, err := dohResolver.LookupAAAA("router.nextdns.io")
+				if err != nil {
+					log.Fatalf("Error resolving router.nextdns.io: %v", err)
+				}
+				if len(record) == 0 {
+					log.Fatalf("Error resolving router.nextdns.io: no AAAA record")
+				}
+				addr = strings.Replace(addr, "router.nextdns.io", record[0].IP6, 1)
+			} else {
+				record, _, err := dohResolver.LookupA("router.nextdns.io")
+				if err != nil {
+					log.Fatalf("Error resolving router.nextdns.io: %v", err)
+				}
+				if len(record) == 0 {
+					log.Fatalf("Error resolving router.nextdns.io: no A record")
+				}
+				addr = strings.Replace(addr, "router.nextdns.io", record[0].IP4, 1)
+			}
+			// If resolution fails, fallback to default resolver
+			return dialer.DialContext(ctx, network, addr)
+		},
+	}
+
+	client := &http.Client{
+		Transport: transport,
+	}
+
+	resp, err := client.Get("https://router.nextdns.io/?limit=20&stack=dual")
+	if err != nil {
+		log.Fatalf("Error while contacting router.nextdns.io: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Process the response
+	body, _ := io.ReadAll(resp.Body)
+	var servers []Server
+	var results []Result
+	json.Unmarshal(body, &servers)
+
+	for j := 0; j < 3; j++ {
+		count := 0
+		for _, server := range servers {
+			for _, ip := range server.IPs {
+				if strings.Contains(ip, ":") {
+					ip = "[" + ip + "]"
+				}
+				rtt := checkServer(ip)
+				log.Infof("%s with ip %s has a rtt of %d", server.Hostname, ip, rtt)
 
 				if j > 0 {
-					results[v6index].rtt += rtt
+					results[count].rtt += rtt
 				} else {
-					results[v6index] = Result{server: fqdn, rtt: rtt}
+					results = append(results, Result{server: ip, rtt: rtt})
 				}
+				count++
 			}
 		}
 	}
+	return results
+}
+
+func main() {
+
+	results := getNextDNSRouterIps()
+
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].rtt < results[j].rtt
 	})
 
 	numResults := 0
-	nextdnsResolvers := []net.IP{}
+	var nextdnsResolvers []string
 	for _, result := range results {
 		if !isTLSSuccessful(result.server) {
 			continue
 		}
 
-		lookup := dnsLookup(result.server)
-		if lookup == nil {
-			continue
-		}
-
 		log.Infof("Selected %s with total rtt %d", result.server, result.rtt)
-		nextdnsResolvers = append(nextdnsResolvers, lookup)
+		nextdnsResolvers = append(nextdnsResolvers, result.server)
 		numResults++
 
 		if numResults == 4 {
@@ -114,13 +162,21 @@ func main() {
 	}
 }
 
-func checkServer(url string) int {
-	start := time.Now()
-	resp, err := http.Get(url)
+func checkServer(ip string) int {
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig:     &tls.Config{ServerName: "dns.nextdns.io"},
+			MaxIdleConnsPerHost: -1,
+		},
+		Timeout: 1 * time.Second,
+	}
+	resp, err := client.Get("https://" + ip + "/info")
+
 	if err != nil {
-		log.Errorf("error get %s, error %v", url, err)
+		log.Errorf("error get %s, error %v", ip, err)
 		return 99999999
 	}
+
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
@@ -136,17 +192,17 @@ func checkServer(url string) int {
 		return 99999999
 	}
 
-	return int(time.Since(start).Milliseconds()) + info.Rtt
+	return info.Rtt
 }
 
 // ksTLSSuccessful performs a TLS handshake with a given FQDN at port 853 and
 // returns true if the handshake is successful and false otherwise.
-func isTLSSuccessful(fqdn string) bool {
+func isTLSSuccessful(ip string) bool {
 	conf := &tls.Config{
-		InsecureSkipVerify: false, // Adjust as per your security needs
+		ServerName: "dns.nextdns.io",
 	}
 
-	conn, err := tls.Dial("tcp", fmt.Sprintf("%s:853", fqdn), conf)
+	conn, err := tls.Dial("tcp", fmt.Sprintf("%s:853", ip), conf)
 	if err != nil {
 		log.Errorf("Failed to establish connection: %v", err)
 		return false
@@ -162,17 +218,7 @@ func isTLSSuccessful(fqdn string) bool {
 	return true
 }
 
-func dnsLookup(fqdn string) net.IP {
-	ips, err := net.LookupIP(fqdn)
-	if err != nil {
-		log.Errorf("Error: %v", err)
-		return nil
-	}
-
-	return ips[0]
-}
-
-func modifyForwardLine(corefile string, ips []net.IP) string {
+func modifyForwardLine(corefile string, ips []string) string {
 	lines := strings.Split(corefile, "\n")
 	pattern := regexp.MustCompile(`^(\s*)(forward . (tls://[a-zA-Z0-9\.\[\]:]+:[0-9]+ ?)+({.*)?)$`)
 
@@ -182,13 +228,7 @@ func modifyForwardLine(corefile string, ips []net.IP) string {
 			// Replace the IP addresses in the forward line
 			forwardLine := match[1] + "forward ."
 			for _, ip := range ips {
-				if ip.To4() == nil {
-					// IPv6 address - add brackets
-					forwardLine += " tls://[" + ip.String() + "]:853"
-				} else {
-					// IPv4 address
-					forwardLine += " tls://" + ip.String() + ":853"
-				}
+				forwardLine += " tls://" + ip + ":853"
 			}
 
 			if strings.HasPrefix(match[len(match)-1], "{") {
@@ -201,17 +241,32 @@ func modifyForwardLine(corefile string, ips []net.IP) string {
 	return strings.Join(lines, "\n")
 }
 
-func modifyCoreDNSConfigMap(ips []net.IP) error {
+func modifyCoreDNSConfigMap(ips []string) error {
 	var kubeClient kubernetes.Interface
-	_, err := rest.InClusterConfig()
+	var kubeconfig clientcmd.ClientConfig
+	inClusterConfig, err := rest.InClusterConfig()
+
 	if err != nil {
-		log.Fatalln("only in cluster config is supported")
+		loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+		configOverrides := &clientcmd.ConfigOverrides{}
+		kubeconfig = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
+
+		config, err := kubeconfig.ClientConfig()
+		if err != nil {
+			log.Fatalf("Failed to load kubeconfig: %v", err)
+		}
+		kubeClient, err = kubernetes.NewForConfig(config)
+		if err != nil {
+			log.Fatalf("Failed to create Kubernetes client with kubeconfig: %v", err)
+		}
 	} else {
-		kubeClient = getClient()
+		kubeClient, err = kubernetes.NewForConfig(inClusterConfig)
+		if err != nil {
+			log.Fatalf("Failed to create Kubernetes client with in-cluster config: %v", err)
+		}
 	}
 
 	// Retrieve the CoreDNS ConfigMap in the current namespace
-	kubeconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{})
 	namespace, _, err := kubeconfig.Namespace()
 	if err != nil {
 		namespace = metav1.NamespaceDefault
@@ -242,17 +297,4 @@ func modifyCoreDNSConfigMap(ips []net.IP) error {
 
 	log.Infof("Modified ConfigMap %s/%s successfully", namespace, configMapName)
 	return nil
-}
-func getClient() kubernetes.Interface {
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		log.Fatalf("Can not get kubernetes config: %v", err)
-	}
-
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		log.Fatalf("Can not create kubernetes client: %v", err)
-	}
-
-	return clientset
 }
