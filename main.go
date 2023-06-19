@@ -264,6 +264,7 @@ func modifyCoreDNSConfigMap(ips []string) error {
 		if err != nil {
 			log.Fatalf("Failed to create Kubernetes client with in-cluster config: %v", err)
 		}
+		kubeconfig = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{})
 	}
 
 	// Retrieve the CoreDNS ConfigMap in the current namespace
